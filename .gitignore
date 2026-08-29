@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 data/
+# Captured payloads contain real profile data — never commit them.
+fixtures/
 .env
 .env.*
 !.env.example
