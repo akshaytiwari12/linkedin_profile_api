@@ -18,7 +18,11 @@ def build_headers() -> dict[str, str]:
     (Verified: quoted cookie + unquoted csrf -> 200; any other combination -> 302.)
     """
     return {
-        "cookie": f'li_at={config.li_at}; JSESSIONID="{config.jsessionid}"',
+        # The voyager API accepts just li_at + JSESSIONID, but other LinkedIn surfaces expect
+        # the wider jar a real browser sends (bcookie/lidc/__cf_bm/...). Prefer the full jar
+        # when one is configured.
+        "cookie": config.cookie_jar
+        or f'li_at={config.li_at}; JSESSIONID="{config.jsessionid}"',
         "csrf-token": config.jsessionid,
         "accept": "application/vnd.linkedin.normalized+json+2.1",
         "x-restli-protocol-version": "2.0.0",
