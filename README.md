@@ -14,8 +14,8 @@ curl "https://<host>/api/profile?url=https://www.linkedin.com/in/john-doe"
 ## Approach
 
 LinkedIn has no public API for reading arbitrary profile data. The interesting part of this
-problem isn't finding an endpoint — it's staying authenticated once you do. Three findings
-shaped the design, each established empirically against the live API rather than assumed.
+problem isn't finding an endpoint — it's staying authenticated once you do. Four findings shaped
+the design, most of them established empirically against the live API rather than assumed.
 
 ### Finding 1 — voyager still works, but the browser no longer reveals it
 
@@ -65,7 +65,28 @@ This is why the service is written in Python: `curl_cffi` is the practical way t
 genuine browser TLS/HTTP2 fingerprint. It is the single most load-bearing line in the codebase
 (`app/linkedin_client.py`), and no amount of header tuning or slower pacing substitutes for it.
 
-### Finding 3 — the two cookie-quoting details that decide 200 vs. 302
+### Finding 3 — authentication is a three-legged stool, and IP is the third leg
+
+A valid `li_at` cookie is necessary but not sufficient. LinkedIn checks that the **session cookie,
+the client fingerprint, and the IP's reputation/geolocation** are mutually consistent. Break any
+one and the session is invalidated globally — not just the request rejected.
+
+The practical consequences:
+
+- **Datacenter IPs burn cookies.** A cookie captured on a home connection and then used from a
+  cloud host is an IP that has never logged into that account. Published guidance is consistent
+  that this triggers an authwall or challenge almost immediately.
+- **Rotating proxies are worse than none.** Changing IP mid-session invalidates it outright. If a
+  proxy is used it must be a *sticky* residential session in the login's region — hence
+  `LINKEDIN_PROXY` documents "sticky" rather than "pool".
+- **Running locally, from the machine the cookie was created on, is the safest configuration** —
+  all three legs stay consistent by construction.
+
+Rate guidance from the same sources: **1–2 requests/minute** and roughly **80–100/day** per
+account, with sustained voyager abuse drawing bans within days. The pacing defaults
+(`MIN_REQUEST_INTERVAL_S=40`, `REQUEST_JITTER_S=20`) target the low end of that.
+
+### Finding 4 — the two cookie-quoting details that decide 200 vs. 302
 
 LinkedIn stores `JSESSIONID` wrapped in literal double quotes, and the two places it's used need
 *different* quoting. Verified by testing each combination:
@@ -265,6 +286,11 @@ LinkedIn having moved a section to a different entity type or a separate endpoin
   browser login, so recovery is manual: capture new cookies, restart, `POST /api/session/reset`.
 - **Single session, no pool.** Once the circuit breaker opens the service is down until someone
   refreshes the cookie. `session-health` is keyed for a future pool, but only one is wired today.
+- **Deployment fights the IP constraint.** Running on a cloud host means a datacenter IP that has
+  never logged into the account, which burns sessions quickly (Finding 3). A deployed instance
+  realistically needs `LINKEDIN_PROXY` pointed at a sticky residential proxy in the login's
+  region; without one, expect the live path to degrade to auth failures while cached results keep
+  serving. Running locally from the machine the cookie was created on avoids this entirely.
 - **Undocumented, unstable upstream schema.** Field names and `$type` values have changed between
   LinkedIn releases and will again. The raw-payload store plus `/reparse` limits the blast radius;
   it doesn't prevent the breakage.

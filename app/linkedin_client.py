@@ -28,10 +28,17 @@ def build_headers() -> dict[str, str]:
 
 
 async def voyager_get(path: str) -> Any:
+    kwargs: dict[str, Any] = {}
+    if config.proxy:
+        # Must be a *sticky* session proxy — LinkedIn invalidates a session whose IP changes
+        # mid-flight, so a rotating pool is worse than no proxy at all here.
+        kwargs["proxies"] = {"http": config.proxy, "https": config.proxy}
+
     async with AsyncSession() as session:
         response = await session.get(
             f"{BASE_URL}{path}",
             headers=build_headers(),
+            **kwargs,
             # Presents a real Chrome TLS/JA3 + HTTP2 fingerprint. Without this LinkedIn sees a
             # valid session cookie arriving over an automation-shaped handshake, reads it as a
             # stolen session, and invalidates it globally. This is the single most important

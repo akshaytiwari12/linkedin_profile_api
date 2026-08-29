@@ -37,11 +37,20 @@ class Config:
 
         self.cache_ttl_hours = float(os.getenv("CACHE_TTL_HOURS", "48"))
 
+        # Optional proxy for LinkedIn calls. LinkedIn ties a session to the IP it was created
+        # on: a cookie captured at home and then used from a datacenter IP is treated as
+        # suspicious and burned quickly. Deployments should point this at a *sticky* residential
+        # proxy in the same region as the login. Unset (the default) is correct when running
+        # locally from the machine the cookie was created on.
+        self.proxy = os.getenv("LINKEDIN_PROXY") or None
+
         # Minimum spacing between real LinkedIn requests plus random jitter, so the request
-        # cadence looks like a human browsing rather than a script. Defaults are deliberately
-        # conservative: an invalidated session costs a manual browser re-login.
-        self.min_request_interval_s = float(os.getenv("MIN_REQUEST_INTERVAL_S", "12"))
-        self.request_jitter_s = float(os.getenv("REQUEST_JITTER_S", "8"))
+        # cadence looks like a human browsing rather than a script. Published guidance for
+        # voyager is 1-2 requests/minute and ~80-100/day per account; these defaults land at
+        # roughly 1-1.5/min. An invalidated session costs a manual browser re-login, so the
+        # defaults deliberately favour safety over throughput.
+        self.min_request_interval_s = float(os.getenv("MIN_REQUEST_INTERVAL_S", "40"))
+        self.request_jitter_s = float(os.getenv("REQUEST_JITTER_S", "20"))
 
         self.session_failure_threshold = int(os.getenv("SESSION_FAILURE_THRESHOLD", "2"))
 
