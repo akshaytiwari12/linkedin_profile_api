@@ -29,6 +29,12 @@ class Config:
         # so normalize once here.
         self.jsessionid = _strip_quotes(_require("LI_JSESSIONID"))
 
+        # Optional full browser cookie jar. The voyager API is happy with just li_at +
+        # JSESSIONID, but the mwlite surface expects the wider set a real browser sends
+        # (bcookie/lidc/__cf_bm/...). When set, this is used verbatim in place of the
+        # two-cookie header.
+        self.cookie_jar = os.getenv("LI_COOKIE_JAR") or None
+
         # curl_cffi impersonation target. Determines the TLS/JA3 + HTTP2 fingerprint we present.
         self.impersonate = os.getenv("IMPERSONATE", "chrome")
 
