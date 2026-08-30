@@ -1,15 +1,81 @@
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path as FilePath
 
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Path, Query
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from . import stores, worker
 from .config import config
 from .errors import InvalidProfileUrlError
 from .html_parser import PARSER_VERSION, parse_profile_html
 from .linkedin_client import reset_session
+from .models import (
+    ErrorResponse,
+    HealthResponse,
+    JobAccepted,
+    JobStatus,
+    LinkedInProfile,
+    ResetResponse,
+    SessionHealth,
+)
 from .profile_url import extract_public_identifier
+
+API_DESCRIPTION = """
+Accepts a LinkedIn profile URL and returns the profile as structured JSON.
+
+Reaches LinkedIn directly over HTTP — **no browser, no headless Chrome, no automation
+framework**. Requests carry a logged-in session cookie and a TLS fingerprint that matches a real
+Chrome build, because LinkedIn fingerprints the TLS handshake itself and invalidates sessions
+whose handshake looks automated.
+
+### Quick start
+
+    GET /api/profile?url=https://www.linkedin.com/in/some-profile
+
+Use **Try it out** below on `/api/profile` — it is the only endpoint most callers need.
+
+### How a request is served
+
+1. The URL is validated as a real `linkedin.com/in/…` address (anything else is rejected).
+2. **Cache hit** → returned immediately, no LinkedIn request. `"source": "cache"`.
+3. **Cache miss** → a job is queued and briefly awaited, so the call still looks synchronous.
+   `"source": "live"`.
+4. If LinkedIn is slow, `202` is returned with a `jobId` to poll at `/api/jobs/{id}` rather than
+   holding the connection open.
+
+### Rate limiting
+
+Requests to LinkedIn are paced (default ~1 per minute, with jitter) and stop entirely after
+repeated auth failures, because an over-used session gets invalidated and can only be restored
+by logging in through a browser again. A burst of calls will therefore queue rather than run in
+parallel — this is deliberate.
+
+### Fields that are always null
+
+`skills[].endorsementCount` and `certifications[].authority` are not rendered on the surface
+this service reads. `about` and `experience[].description` may be truncated to the portion
+LinkedIn renders before its "see more" control.
+
+### Authentication
+
+The service authenticates to LinkedIn with cookies supplied as environment variables
+(`LI_AT_COOKIE`, `LI_JSESSIONID`). **This API itself is unauthenticated** — anyone who can reach
+it can spend the configured session's rate budget. An API key would be the first thing to add
+before exposing it publicly.
+"""
+
+TAGS_METADATA = [
+    {"name": "Profiles", "description": "Fetch and re-parse profile data."},
+    {"name": "Jobs", "description": "Poll asynchronous fetches started by `/api/profile`."},
+    {
+        "name": "Session",
+        "description": "Inspect and reset the LinkedIn session's circuit breaker.",
+    },
+    {"name": "Service", "description": "Liveness."},
+]
 
 
 @asynccontextmanager
@@ -21,12 +87,48 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="LinkedIn Profile API",
-    description="Reverse-engineered LinkedIn profile data as structured JSON.",
+    version="1.0.0",
+    description=API_DESCRIPTION,
+    openapi_tags=TAGS_METADATA,
     lifespan=lifespan,
+    # The stock /docs and /redoc load their assets from cdn.jsdelivr.net, so the page renders
+    # blank for anyone whose network blocks that CDN — the server still answers 200, which makes
+    # it look like the service is broken. Assets are vendored under app/static and the routes
+    # re-declared below so the documentation works on any network, including offline.
+    docs_url=None,
+    redoc_url=None,
 )
 
+_STATIC_DIR = FilePath(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
-@app.get("/health")
+
+@app.get("/docs", include_in_schema=False)
+async def swagger_ui() -> HTMLResponse:
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} — API reference",
+        swagger_js_url="/static/swagger-ui-bundle.js",
+        swagger_css_url="/static/swagger-ui.css",
+    )
+
+
+@app.get("/redoc", include_in_schema=False)
+async def redoc_ui() -> HTMLResponse:
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} — reference",
+        redoc_js_url="/static/redoc.standalone.js",
+    )
+
+
+@app.get(
+    "/health",
+    tags=["Service"],
+    summary="Liveness check",
+    description="Returns `{\"status\": \"ok\"}` if the process is up. Does not contact LinkedIn.",
+    response_model=HealthResponse,
+)
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 
@@ -46,8 +148,44 @@ async def _wait_for_job(job_id: str) -> dict:
     return job or {}
 
 
-@app.get("/api/profile")
-async def get_profile(url: str = Query(..., description="LinkedIn profile URL")):
+@app.get(
+    "/api/profile",
+    tags=["Profiles"],
+    summary="Get a LinkedIn profile as structured JSON",
+    description=(
+        "The main endpoint. Pass any LinkedIn profile URL as `url`.\n\n"
+        "Accepted forms — all resolve to the same profile:\n\n"
+        "- `https://www.linkedin.com/in/some-profile`\n"
+        "- `https://www.linkedin.com/in/some-profile/`\n"
+        "- `https://in.linkedin.com/in/some-profile?trk=abc`\n"
+        "- `linkedin.com/in/some-profile`\n\n"
+        "Company pages, feed URLs and non-LinkedIn hosts are rejected with `400`.\n\n"
+        "Check the `source` field to see whether the response came from cache or a live fetch. "
+        "A cache miss costs one real LinkedIn request and is paced, so it can take a few seconds."
+    ),
+    response_model=LinkedInProfile,
+    responses={
+        202: {
+            "model": JobAccepted,
+            "description": "Fetch still running. Poll `statusUrl` for the result.",
+        },
+        400: {"model": ErrorResponse, "description": "`url` missing, malformed, or not a profile URL."},
+        502: {
+            "model": ErrorResponse,
+            "description": (
+                "The fetch failed — expired session, LinkedIn blocked the request, the profile "
+                "does not exist, or the circuit breaker is open. `error` states which."
+            ),
+        },
+    },
+)
+async def get_profile(
+    url: str = Query(
+        ...,
+        description="Full LinkedIn profile URL.",
+        examples=["https://www.linkedin.com/in/some-profile"],
+    )
+):
     try:
         public_identifier = extract_public_identifier(url)
     except InvalidProfileUrlError as err:
@@ -86,8 +224,21 @@ async def get_profile(url: str = Query(..., description="LinkedIn profile URL"))
     )
 
 
-@app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str):
+@app.get(
+    "/api/jobs/{job_id}",
+    tags=["Jobs"],
+    summary="Poll an in-flight fetch",
+    description=(
+        "Only needed when `/api/profile` returned `202`. Poll every second or so; the profile "
+        "arrives in `result` once `status` is `completed`."
+    ),
+    response_model=JobStatus,
+    responses={
+        404: {"model": ErrorResponse, "description": "No job with that id."},
+        502: {"model": ErrorResponse, "description": "The job failed; `error` states why."},
+    },
+)
+async def get_job(job_id: str = Path(description="Job id returned by `/api/profile`.")):
     job = stores.get_job(job_id)
     if not job:
         return JSONResponse(status_code=404, content={"error": f'No job found with id "{job_id}".'})
@@ -106,10 +257,30 @@ async def get_job(job_id: str):
     return {"id": job["id"], "status": job["status"], "updatedAt": job["updatedAt"]}
 
 
-@app.post("/api/profile/{public_identifier}/reparse")
-async def reparse(public_identifier: str):
-    """Re-normalizes the latest stored raw payload through the current parser — no LinkedIn
-    request. This is the payoff of storing raw responses separately from parsed ones."""
+@app.post(
+    "/api/profile/{public_identifier}/reparse",
+    tags=["Profiles"],
+    summary="Re-parse a stored page without contacting LinkedIn",
+    description=(
+        "Every fetched page is stored before it is parsed. This re-runs the current parser "
+        "against the most recently stored page for a profile, so a parser fix can be applied to "
+        "already-fetched profiles without spending another LinkedIn request — the scarce and "
+        "risky resource here.\n\n"
+        "Takes the profile slug, not a full URL: `some-profile`, not the whole link."
+    ),
+    response_model=LinkedInProfile,
+    responses={
+        404: {
+            "model": ErrorResponse,
+            "description": "Nothing stored for that profile yet — fetch it via `/api/profile` first.",
+        }
+    },
+)
+async def reparse(
+    public_identifier: str = Path(
+        description="Profile slug, e.g. `some-profile`.", examples=["some-profile"]
+    )
+):
     record = stores.latest_raw_payload_for(public_identifier)
     if not record:
         return JSONResponse(
@@ -126,15 +297,33 @@ async def reparse(public_identifier: str):
     return {**profile, "source": "reparsed"}
 
 
-@app.get("/api/session/health")
+@app.get(
+    "/api/session/health",
+    tags=["Session"],
+    summary="Is the LinkedIn session usable?",
+    description=(
+        "Reports the circuit breaker. `state: flagged` means repeated auth failures have tripped "
+        "it and no further requests will be sent until it is reset — which is deliberate: "
+        "continuing to hammer a rejected session is what escalates a logout into an account "
+        "restriction."
+    ),
+    response_model=SessionHealth,
+)
 async def session_health():
     return stores.get_session_health()
 
 
-@app.post("/api/session/reset")
+@app.post(
+    "/api/session/reset",
+    tags=["Session"],
+    summary="Clear the circuit breaker after refreshing cookies",
+    description=(
+        "Call after updating `LI_AT_COOKIE` / `LI_JSESSIONID`. Clears the failure count and drops "
+        "the cached HTTP session so the next request re-warms with the new cookies."
+    ),
+    response_model=ResetResponse,
+)
 async def session_reset():
-    """Clear the circuit breaker and drop the cached HTTP session, so the next request re-warms
-    with whatever cookies are currently configured."""
     stores.reset_session_health()
     await reset_session()
     return {"status": "reset"}
