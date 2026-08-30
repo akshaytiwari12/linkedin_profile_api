@@ -1,10 +1,22 @@
+# Render deployment (free tier — no payment method required).
+#
+# Region: Singapore is Render's closest to India. LinkedIn checks that the session cookie, the
+# client fingerprint and the IP's geography are mutually consistent, so the nearer the host is to
+# where the account normally signs in, the fewer signals stack up. See README "Known limitations".
+#
+# Free instances sleep after ~15 minutes idle, so the first request after a quiet period takes
+# roughly a minute to answer while the machine wakes. /health is the cheapest way to wake it.
+
 services:
   - type: web
     name: linkedin-profile-api
     runtime: python
     plan: free
+    region: singapore
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    # One worker deliberately: the fetch queue and its pacing live in-process, so a second worker
+    # would pace the same LinkedIn session independently — which is what gets a session flagged.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
     envVars:
       # Set these in the Render dashboard — never commit real values.
@@ -12,13 +24,18 @@ services:
         sync: false
       - key: LI_JSESSIONID
         sync: false
+      # Optional. Volatile cookies are filtered out of it automatically; the session earns its
+      # own. See app/session_jar.py.
       - key: LI_COOKIE_JAR
         sync: false
-      # A deployed instance runs from a datacenter IP, which LinkedIn treats as
-      # untrusted for a session created elsewhere. Point this at a sticky
-      # residential proxy in the login's region, or expect the live path to
-      # degrade to auth failures while cache keeps serving.
+      # A deployed instance runs from a datacenter IP, which LinkedIn treats as untrusted for a
+      # session created elsewhere. Point this at a STICKY residential proxy in the login's region
+      # if live fetches start failing — a rotating pool is worse than none.
       - key: LINKEDIN_PROXY
         sync: false
       - key: IMPERSONATE
         value: chrome
+      # Free instances have an ephemeral filesystem: this is wiped on restart and redeploy, so
+      # the cache rebuilds on demand and the raw-page history behind /reparse does not survive.
+      - key: DATA_DIR
+        value: /tmp/data
