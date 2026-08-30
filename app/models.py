@@ -115,19 +115,55 @@ class LinkedInProfile(BaseModel):
 
 
 class JobAccepted(BaseModel):
-    """Returned when a fetch is still running past the long-poll window."""
+    """Returned by `/api/profile` when the fetch is still running past the long-poll window.
 
-    jobId: str = Field(examples=["3f9a1c74-9c2e-4f2a-9c1b-2f9f0a1d7e55"])
-    status: Literal["queued", "processing"] = Field(examples=["processing"])
-    statusUrl: str = Field(examples=["/api/jobs/3f9a1c74-9c2e-4f2a-9c1b-2f9f0a1d7e55"])
+    Requests to LinkedIn are queued and paced rather than run on demand, so a cache miss can
+    outlast the window the API is willing to hold a connection open for. Rather than hang, it
+    hands back a handle to the work in progress.
+    """
+
+    jobId: str = Field(
+        description="Identifier for the queued fetch. Pass it to `/api/jobs/{job_id}` to "
+        "retrieve the profile once the fetch completes.",
+        examples=["3f9a1c74-9c2e-4f2a-9c1b-2f9f0a1d7e55"],
+    )
+    status: Literal["queued", "processing"] = Field(
+        description="`queued` — waiting for the worker. `processing` — the fetch is running.",
+        examples=["processing"],
+    )
+    statusUrl: str = Field(
+        description="Ready-made path to poll; equivalent to `/api/jobs/{jobId}`.",
+        examples=["/api/jobs/3f9a1c74-9c2e-4f2a-9c1b-2f9f0a1d7e55"],
+    )
 
 
 class JobStatus(BaseModel):
-    id: str
-    status: Literal["queued", "processing", "completed", "failed"]
-    result: LinkedInProfile | None = Field(None, description="Present only when `completed`.")
-    error: str | None = Field(None, description="Present only when `failed`.")
-    updatedAt: str | None = None
+    """State of a queued fetch. Poll until `status` is `completed` or `failed`."""
+
+    id: str = Field(
+        description="The job id, as returned in the `202` from `/api/profile`.",
+        examples=["3f9a1c74-9c2e-4f2a-9c1b-2f9f0a1d7e55"],
+    )
+    status: Literal["queued", "processing", "completed", "failed"] = Field(
+        description=(
+            "`queued` — waiting for the worker. "
+            "`processing` — fetching from LinkedIn. "
+            "`completed` — done, see `result`. "
+            "`failed` — see `error`."
+        ),
+        examples=["completed"],
+    )
+    result: LinkedInProfile | None = Field(
+        None, description="The profile. Present only when `status` is `completed`."
+    )
+    error: str | None = Field(
+        None,
+        description="Why the fetch failed. Present only when `status` is `failed`.",
+        examples=["LinkedIn session is invalid or expired."],
+    )
+    updatedAt: str | None = Field(
+        None, description="When the job last changed state (ISO 8601, UTC)."
+    )
 
 
 class SessionHealth(BaseModel):
