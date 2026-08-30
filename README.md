@@ -179,8 +179,21 @@ and `/api/session/health` all serve from there.
 
 Live profile fetches from that instance currently fail, and the cause is documented under Known
 Limitations: a request carrying this session from a datacenter IP causes LinkedIn to revoke the
-session outright. Resolving it needs `LINKEDIN_PROXY` set to a sticky residential endpoint in
-the account's region; the code path already exists and needs no change.
+session outright.
+
+`LINKEDIN_PROXY` exists for this and needs no code change, but it is worth being precise about
+how much it would buy. Reported survival rates against LinkedIn by egress type:
+
+| Egress | Survives |
+| --- | --- |
+| Datacenter (AWS/GCP/PaaS) | 10–20% — matches what was measured here |
+| Residential proxy | ~50% |
+| Mobile carrier | ~85% |
+
+A residential proxy is therefore closer to a coin flip than a fix. The common failure is
+inherited reputation: a rented IP carries whatever abuse history previous users of that pool
+left on it, and LinkedIn flags ASN ranges persistently. The reliable configuration is an egress
+that genuinely belongs to a consumer connection — which is what the tunnel below provides.
 
 **Every result in the Validation table was produced by running locally**, where the request
 originates from the same connection the session was created on. To reproduce:
