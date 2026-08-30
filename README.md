@@ -1,57 +1,75 @@
 # LinkedIn Profile API
 
-An HTTP API that accepts a LinkedIn profile URL and returns the profile as structured JSON. It
-calls LinkedIn's internal `voyager` API directly — **no browser, no headless Chrome, no DOM
-scraping** — authenticated with a logged-in session cookie and a TLS fingerprint that matches a
-real browser.
+An HTTP API that accepts a LinkedIn profile URL and returns the profile as structured JSON.
+It reaches LinkedIn directly over HTTP — **no browser, no headless Chrome, no automation
+framework** — using a logged-in session cookie and a TLS fingerprint that matches a real browser.
 
 ```bash
-curl "https://<host>/api/profile?url=https://www.linkedin.com/in/john-doe"
+curl "http://localhost:8000/api/profile?url=https://www.linkedin.com/in/some-profile"
 ```
 
 ---
 
 ## Approach
 
-LinkedIn has no public API for reading arbitrary profile data. The interesting part of this
-problem isn't finding an endpoint — it's staying authenticated once you do. Four findings shaped
-the design, most of them established empirically against the live API rather than assumed.
+LinkedIn has no public API for reading arbitrary profile data, so the endpoint has to be found
+rather than looked up. The interesting part of this problem turned out not to be finding *an*
+endpoint — it was that most of the documented ones are dead, and that staying authenticated is
+harder than getting authenticated. Four findings shaped the final design, each established by
+testing against the live API.
 
-### Finding 1 — voyager still works, but the browser no longer reveals it
+### Finding 1 — the documented endpoints are gone
 
-Observing linkedin.com in DevTools today shows **no** `voyager` calls. The profile page loads
-through React Server Components (`POST /flagship-web/rsc-action/actions/component`). It's easy
-to conclude from this that the voyager API is gone and that you must reverse-engineer the RSC
-protocol.
+Nearly every public write-up on this subject points at `voyager`'s REST API. Tested directly:
 
-That conclusion is wrong. Under RSC the data flow became:
+| Endpoint | Result |
+| --- | --- |
+| `GET /voyager/api/me` | **200** — voyager itself is alive |
+| `GET /voyager/api/identity/profiles/{id}/profileView` | **410 Gone** |
+| `GET /voyager/api/identity/profiles/{id}` | 302 → login |
+| `GET /voyager/api/identity/dash/profiles?q=memberIdentity` | 302 → login |
+| `GET /voyager/api/identity/dash/profiles/{urn}` | 302 → login |
+| public profile page, unauthenticated | **999** authwall |
+
+`profileView` — the endpoint almost every tutorial uses — is explicitly tombstoned. The rest of
+the identity surface answers with a catch-all redirect. Since `/me` still returns 200 with the
+same credentials, these are endpoint deaths, not auth failures.
+
+### Finding 2 — the browser no longer reveals the API
+
+Watching linkedin.com in DevTools shows **no** `voyager` calls at all. The desktop site loads
+profiles through React Server Components (`POST /flagship-web/rsc-action/actions/component`).
+It is tempting to conclude voyager is gone and that the RSC protocol must be reverse-engineered.
+
+That conclusion is wrong, but so is the opposite one. Under RSC the flow became:
 
 ```
-browser → rsc-action → LinkedIn's BFF server → voyager (server-to-server) → RSC payload → browser
+browser → rsc-action → LinkedIn's server → voyager (internal) → rendered payload → browser
 ```
 
-Voyager didn't disappear; it moved *behind* LinkedIn's own server where DevTools can't see it.
-A direct request confirms it still accepts cookie auth and returns clean JSON:
+Voyager didn't disappear; it moved *behind* LinkedIn's own server, where DevTools cannot see it —
+and the parts of it still reachable from outside no longer include profiles.
 
-```
-GET /voyager/api/me   →  200  {"data":{"plainId":...,"$type":"com.linkedin.voyager..."}}
-```
+The surface that does still work is **mwlite**, LinkedIn's lightweight mobile web client. Unlike
+the desktop app, mwlite **server-renders the entire profile into the HTML**. That has a useful
+consequence: one plain HTTP request returns the whole profile, with no client-side fetching to
+replicate. It also explains why there is no profile GraphQL query to call — mwlite's
+`runQuery` endpoint exists (and works) but the profile never travels through it.
 
-So this service targets voyager, not RSC. That matters: the RSC route would mean parsing React's
-internal "flight" stream format and tracking build-hash action IDs that rotate on every LinkedIn
-deploy — dramatically more fragile, with no stability contract at all.
+So the fetch is a single authenticated `GET https://www.linkedin.com/in/{identifier}/` with a
+mobile user agent, and the parser reads markup.
 
-### Finding 2 — the TLS fingerprint is the real gate
+### Finding 3 — the TLS fingerprint is the real gate
 
 The first implementation used a normal HTTP client with correct cookies and browser-like headers.
-It worked, then the session was **invalidated globally** — logging the account out of the real
-browser too — after a handful of requests.
+It worked — and then the session was **invalidated globally**, logging the account out of the
+real browser too, after a handful of requests.
 
-The cause wasn't the cookies or the headers or the request rate. Anti-bot systems fingerprint the
+The cause was not the cookies, the headers, or the request rate. Anti-bot systems fingerprint the
 **TLS handshake itself** (cipher order, extensions, HTTP/2 SETTINGS) via JA3 hashing, before a
 single HTTP header is parsed. A valid session cookie arriving over an automation-shaped handshake
-is, to LinkedIn, indistinguishable from a stolen session — and the correct response to a stolen
-session is to kill it everywhere.
+is indistinguishable from a stolen session, and the correct response to a stolen session is to
+kill it everywhere.
 
 Measured against `tls.browserleaks.com`:
 
@@ -59,63 +77,50 @@ Measured against `tls.browserleaks.com`:
 | --- | --- | --- |
 | `curl` | `4ea056e6…` | flagged → session invalidated |
 | Node `fetch` / undici | `1a28e690…` | flagged → session invalidated |
-| **`curl_cffi` (`impersonate="chrome"`)** | `51ed4e88…` | real Chrome fingerprint |
+| **`curl_cffi` (`chrome131_android`)** | `51ed4e88…` | genuine Chrome fingerprint |
 
-This is why the service is written in Python: `curl_cffi` is the practical way to present a
-genuine browser TLS/HTTP2 fingerprint. It is the single most load-bearing line in the codebase
-(`app/linkedin_client.py`), and no amount of header tuning or slower pacing substitutes for it.
+This is why the service is written in Python: `curl_cffi` is the practical way to present a real
+browser TLS/HTTP2 fingerprint. It is the single most load-bearing line in the codebase
+(`app/linkedin_client.py`), and no amount of header tuning substitutes for it.
 
-### Finding 3 — authentication is a three-legged stool, and IP is the third leg
+### Finding 4 — cookies split into durable and volatile
 
-A valid `li_at` cookie is necessary but not sufficient. LinkedIn checks that the **session cookie,
-the client fingerprint, and the IP's reputation/geolocation** are mutually consistent. Break any
-one and the session is invalidated globally — not just the request rejected.
+A request that worked would start redirect-looping thirty minutes later with nothing changed.
+The jar has two classes of cookie and conflating them is what causes it:
 
-The practical consequences:
-
-- **Datacenter IPs burn cookies.** A cookie captured on a home connection and then used from a
-  cloud host is an IP that has never logged into that account. Published guidance is consistent
-  that this triggers an authwall or challenge almost immediately.
-- **Rotating proxies are worse than none.** Changing IP mid-session invalidates it outright. If a
-  proxy is used it must be a *sticky* residential session in the login's region — hence
-  `LINKEDIN_PROXY` documents "sticky" rather than "pool".
-- **Running locally, from the machine the cookie was created on, is the safest configuration** —
-  all three legs stay consistent by construction.
-
-Rate guidance from the same sources: **1–2 requests/minute** and roughly **80–100/day** per
-account, with sustained voyager abuse drawing bans within days. The pacing defaults
-(`MIN_REQUEST_INTERVAL_S=40`, `REQUEST_JITTER_S=20`) target the low end of that.
-
-### Finding 4 — the two cookie-quoting details that decide 200 vs. 302
-
-LinkedIn stores `JSESSIONID` wrapped in literal double quotes, and the two places it's used need
-*different* quoting. Verified by testing each combination:
-
-| Cookie `JSESSIONID` | `csrf-token` header | Result |
+| Class | Cookies | Lifetime |
 | --- | --- | --- |
-| `"ajax:123"` (quoted) | `ajax:123` (unquoted) | **200 OK** |
-| `"ajax:123"` (quoted) | `"ajax:123"` (quoted) | 302 → login |
-| `ajax:123` (unquoted) | `ajax:123` (unquoted) | 302 → login |
+| **Durable** | `li_at`, `JSESSIONID`, `bcookie`, `liap` | long-lived — these belong in `.env` |
+| **Volatile** | `__cf_bm`, `lidc` | `__cf_bm` expires after **30 minutes of inactivity** |
 
-An invalid session is answered with a **302 redirect to the login page**, never a clean 401 — so
-the client disables redirect-following and treats any 3xx as an auth failure. Without that you
-follow the redirect and try to parse an HTML login page as JSON.
+`__cf_bm` is Cloudflare's bot-management token: encrypted, decryptable only by Cloudflare, and
+therefore impossible to forge. Replaying a stale one is *worse* than omitting it — the server
+tries to re-issue while the client keeps presenting the expired value, and the two bounce until
+the redirect limit trips. `app/session_jar.py` seeds only the durable cookies and lets the
+session collect the volatile ones from `Set-Cookie`.
+
+Two smaller details, both of which produce a 302 if wrong:
+
+- the `JSESSIONID` **cookie** keeps its surrounding double quotes; the `csrf-token` **header**
+  must not have them
+- an invalid session gets a **302 to the login page**, never a clean 401 — so redirects are
+  treated as auth failures rather than followed into an HTML login page
 
 ---
 
 ## Architecture
 
-A naive implementation calls LinkedIn synchronously on every request. That burns rate budget on
-repeat lookups, makes client latency a function of LinkedIn's mood, and loses everything the
-moment the schema shifts. This is built as a pipeline that separates fetching (expensive, risky,
-rate-limited) from serving (cheap, instant):
+A naive implementation calls LinkedIn synchronously on every request. That burns a scarce,
+risky resource on repeat lookups, makes client latency a function of LinkedIn's mood, and loses
+everything already fetched the moment the markup shifts. This is built as a pipeline that
+separates fetching (expensive, rate-limited, account-risking) from serving (cheap, instant):
 
 ```
 Client → API ──► Result Cache (hit) ──────────────────────► response
              └─► (miss) Job Queue → Worker → Session Manager → LinkedIn
                                                   │      (pacing + circuit breaker)
                                                   ▼
-                                    Raw Payload Store (immutable)
+                                       Raw HTML Store (immutable)
                                                   │
                                                   ▼
                                     Parser (versioned) → Result Cache
@@ -123,19 +128,47 @@ Client → API ──► Result Cache (hit) ────────────
 
 | Component | File | Why it exists |
 | --- | --- | --- |
-| API gateway | `app/main.py` | Cache-first. On a miss, enqueues and long-polls briefly so the call still looks synchronous; falls back to `202 + jobId` rather than hanging. |
-| Result cache | `app/stores/` | Repeat lookups cost zero LinkedIn requests — reduces detection risk as much as latency. |
-| Job queue + worker | `app/worker.py` | One job at a time against one session. Decouples client load from LinkedIn call rate. |
-| Session manager | `app/session_manager.py` | Pacing with jitter + **circuit breaker**: after repeated auth failures it stops entirely rather than pushing a flagged session toward a hard account restriction. |
-| LinkedIn client | `app/linkedin_client.py` | TLS impersonation, exact cookie/csrf quoting, redirect-as-auth-failure. |
-| Raw payload store | `app/stores/` | Every raw response persisted **before** parsing. |
-| Parser | `app/profile_parser.py` | Pure `raw → profile`, versioned. Filters voyager's flat `included[]` entity list by `$type`. |
+| API gateway | `app/main.py` | Cache-first. On a miss it enqueues and briefly long-polls so the call still looks synchronous, then falls back to `202 + jobId` rather than hanging. |
+| Result cache | `app/stores/` | Repeat lookups cost zero LinkedIn requests — that reduces detection risk as much as latency. |
+| Job queue + worker | `app/worker.py` | One job at a time against one session; decouples client load from LinkedIn call rate. |
+| Session manager | `app/session_manager.py` | Pacing with jitter, plus a **circuit breaker** that stops entirely after repeated auth failures rather than pushing a flagged session toward a hard account restriction. |
+| LinkedIn client | `app/linkedin_client.py` | TLS impersonation, cookie/csrf quoting, redirect-as-auth-failure. |
+| Cookie jar | `app/session_jar.py` | Durable/volatile split (Finding 4). |
+| Raw HTML store | `app/stores/` | Every fetched page persisted **before** parsing. |
+| Parser | `app/html_parser.py` | Pure `html → profile`, versioned. |
 
-**Why storing raw payloads matters.** `voyager` is an internal API with no stability contract. When
-its shape changes and the parser breaks, you fix the parser and replay it against already-stored
-payloads (`POST /api/profile/{id}/reparse`) — recovering every previously-fetched profile without
-spending a single additional LinkedIn request. Given that requests are the scarce, risky resource
+**Why the raw store matters.** The markup is an internal implementation detail with no stability
+contract. When it changes and the parser breaks, you fix the parser and replay it against pages
+already on disk (`POST /api/profile/{id}/reparse`) — recovering every previously-fetched profile
+without spending another LinkedIn request. Given that requests are the scarce and risky resource
 here, that separation is the most valuable property in the design.
+
+### Parser strategy
+
+Selectors anchor on LinkedIn's **semantic component classes**, never on layout or utility
+classes, and sections are located by their heading text rather than by position:
+
+| Field | Anchor |
+| --- | --- |
+| headline | span whose parent is `body-small text-color-text` |
+| location | span whose parent is `body-small text-color-text-low-emphasis` |
+| current company | `member-current-company` |
+| experience / education | `profile-entity-lockup`, bucketed by nearest preceding heading |
+| skills | `skill-item` |
+| certifications | list items under the `Certifications` heading |
+
+Two details the markup forces:
+
+- **Dates are split across sibling spans** (`"Jan 2024 -"` / `"Present"`), so ranges are matched
+  against the joined text of a lockup rather than any single line.
+- **Duration lines** (`2 yrs 8 mos`) and collapsible affordances (`…more`, `See less`) are
+  filtered before fields are assigned, or they contaminate company and location.
+
+An earlier version picked these fields by text length and position instead. It mis-assigned
+silently and differently per profile — one sample returned its About text as the headline,
+another returned its headline as the location, and a profile with no location returned its
+company in that field. All three passed a casual eyeball. `tests/test_html_parser.py` pins both
+observed top-card orderings so that class of bug cannot return.
 
 ---
 
@@ -144,8 +177,8 @@ here, that separation is the most valuable property in the design.
 ### 1. Capture a LinkedIn session
 
 1. Log into linkedin.com in a browser.
-2. DevTools → Application → Cookies → `https://www.linkedin.com`.
-3. Copy `li_at` and `JSESSIONID`.
+2. DevTools → Network → any request → **Copy as cURL**.
+3. Take the `cookie:` header value, plus `li_at` and `JSESSIONID` from it.
 
 ### 2. Configure
 
@@ -155,7 +188,8 @@ cp .env.example .env
 
 ```
 LI_AT_COOKIE=<li_at value>
-LI_JSESSIONID=ajax:...           # with or without quotes; normalized internally
+LI_JSESSIONID=ajax:...            # with or without quotes; normalized internally
+LI_COOKIE_JAR=<full cookie header>  # optional but recommended
 IMPERSONATE=chrome
 ```
 
@@ -165,21 +199,16 @@ IMPERSONATE=chrome
 
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Interactive API docs at `/docs` (FastAPI/OpenAPI, generated).
+Interactive OpenAPI docs at `/docs`.
 
 ### 4. Deploy
 
-Any host that runs a Python process (Render, Railway, Fly.io). Set `LI_AT_COOKIE`,
-`LI_JSESSIONID`, and `IMPERSONATE` as platform secrets.
-
-> **Note on persistence:** the JSON store writes to `DATA_DIR` on local disk. On hosts with
-> ephemeral filesystems (most free tiers) that directory is wiped on redeploy — the cache
-> degrades gracefully, but the raw-payload history that makes `/reparse` useful does not
-> survive. Attach a persistent volume, or point the store at a managed database, if that
-> history matters.
+Any host that runs a Python process (`Procfile`, `render.yaml`, and `runtime.txt` are included).
+Set the cookie values as platform secrets — see the deployment caveat under Known Limitations,
+which is significant.
 
 ---
 
@@ -189,18 +218,22 @@ Every LinkedIn request risks the session, and a dead session costs a manual brow
 development is **fixture-first**: spend one request, then iterate offline.
 
 ```bash
-# Spend exactly ONE LinkedIn request; save the raw payload to fixtures/
-python3 -m scripts.capture_fixture https://www.linkedin.com/in/some-profile
-
-# Iterate on the parser against that fixture — zero requests, zero risk
-python3 -m scripts.replay_fixture
-
-# Offline tests (synthetic payload, no network)
+# Offline tests — synthetic markup, no network
+python3 -m tests.test_html_parser
 python3 -m tests.test_smoke
+
+# Parse a captured page and report field coverage
+python3 -m scripts.replay_html fixtures/<slug>.mwlite.html
+
+# Load a fixture into the store so the API can be exercised with no network at all
+python3 -m scripts.seed_from_fixture
+
+# Is the configured session still alive? (one request, own account only)
+python3 -m scripts.check_session
 ```
 
-`replay_fixture` prints a coverage summary of which sections populated, which is how you catch
-LinkedIn having moved a section to a different entity type or a separate endpoint.
+`fixtures/` is gitignored — captured pages contain real people's personal data and must not
+reach a public repository.
 
 ---
 
@@ -214,26 +247,27 @@ LinkedIn having moved a section to a different entity type or a separate endpoin
 | Fetched within long-poll window | `200`, `"source": "live"` |
 | Still running | `202` `{ "jobId", "status", "statusUrl" }` — poll `statusUrl` |
 | Fetch failed | `502` `{ "error", "jobId" }` |
-| Bad / non-LinkedIn URL | `400` |
+| Bad or non-LinkedIn URL | `400` |
 
 ```json
 {
-  "publicIdentifier": "john-doe",
-  "profileUrl": "https://www.linkedin.com/in/john-doe/",
-  "firstName": "John",
+  "publicIdentifier": "some-profile",
+  "profileUrl": "https://www.linkedin.com/in/some-profile/",
+  "firstName": "Jane",
   "lastName": "Doe",
-  "fullName": "John Doe",
-  "headline": "Software Engineer at Example Corp",
-  "location": "San Francisco, California, United States",
+  "fullName": "Jane Doe",
+  "headline": "Principal Engineer — Platform & Reliability",
+  "location": "Bengaluru, Karnataka, India",
+  "currentCompany": "Example Systems",
   "about": "...",
-  "profileImages": [{ "url": "https://media.licdn.com/...", "width": 400, "height": 400 }],
+  "profileImages": [{ "url": "https://media.licdn.com/...", "width": null, "height": null }],
   "experience": [
     {
-      "title": "Software Engineer",
-      "companyName": "Example Corp",
-      "location": "San Francisco, CA",
+      "title": "Principal Engineer",
+      "companyName": "Example Systems",
+      "location": "Bengaluru, Karnataka, India",
       "description": "...",
-      "startDate": { "month": 1, "year": 2022 },
+      "startDate": { "month": 1, "year": 2024 },
       "endDate": null,
       "isCurrent": true
     }
@@ -241,27 +275,23 @@ LinkedIn having moved a section to a different entity type or a separate endpoin
   "education": [
     {
       "schoolName": "Example University",
-      "degreeName": "B.S.",
-      "fieldOfStudy": "Computer Science",
-      "startYear": 2016,
-      "endYear": 2020,
+      "degreeName": "BBA",
+      "fieldOfStudy": "Information Technology",
+      "startYear": 2008,
+      "endYear": 2010,
       "description": null
     }
   ],
-  "skills": [{ "name": "TypeScript", "endorsementCount": 12 }],
-  "certifications": [
-    {
-      "name": "AWS Certified Developer",
-      "authority": "Amazon Web Services",
-      "startDate": { "month": 6, "year": 2023 },
-      "endDate": null
-    }
-  ],
-  "languages": [{ "name": "English", "proficiency": "NATIVE_OR_BILINGUAL" }],
-  "fetchedAt": "2026-08-29T12:00:00+00:00",
+  "skills": [{ "name": "Distributed Systems", "endorsementCount": null }],
+  "certifications": [{ "name": "AWS Certified Developer", "authority": null, "startDate": null, "endDate": null }],
+  "languages": [{ "name": "English", "proficiency": null }],
+  "fetchedAt": "2026-08-30T19:20:05+00:00",
   "source": "live"
 }
 ```
+
+Absent sections return `null` or `[]` rather than an error — a profile with no About or no
+Languages section is normal, and the API reports that honestly rather than guessing.
 
 ### Other endpoints
 
@@ -269,55 +299,84 @@ LinkedIn having moved a section to a different entity type or a separate endpoin
 | --- | --- |
 | `GET /health` | Liveness |
 | `GET /api/jobs/{id}` | Poll a job: `queued` / `processing` / `completed` / `failed` |
-| `POST /api/profile/{id}/reparse` | Re-run the parser on the stored raw payload — no LinkedIn request |
+| `POST /api/profile/{id}/reparse` | Re-run the parser on the stored page — no LinkedIn request |
 | `GET /api/session/health` | Session state, consecutive failures, last error |
 | `POST /api/session/reset` | Clear the circuit breaker after refreshing cookies |
+
+---
+
+## Validation
+
+Verified end to end against three live profiles of deliberately different shape:
+
+| | Profile A | Profile B | Profile C |
+| --- | --- | --- | --- |
+| headline / location | 55 / — | 72 / 38 | 132 / 9 |
+| about | 668 chars | 47 chars | absent |
+| experience | 14 | 5 | 4 |
+| education | 3 | 3 | 1 |
+| skills | 37 | 9 | 31 |
+| certifications | 6 | 8 | 0 |
+| languages | 3 | 0 | 0 |
+
+Every empty value was confirmed against the markup rather than assumed: profile A has no
+location element, B and C have no Languages section, C has no About or Certifications. Element
+counts reconcile exactly (e.g. C: 5 lockups = 4 experience + 1 education, 31 `skill-item` = 31
+skills, 0 `sub-list-item` = 0 certifications).
 
 ---
 
 ## Known limitations
 
 - **This violates LinkedIn's Terms of Service.** Automated access to non-public endpoints is
-  against LinkedIn's User Agreement. The backing account risks being challenged, rate-limited, or
+  against LinkedIn's User Agreement. The backing account risks being challenged, rate-limited or
   restricted. This is a demonstration of technique, not a production-safe integration.
-- **Sessions die unpredictably.** `li_at` is nominally long-lived (~1 year), but is invalidated
-  early by password changes, "sign out of all devices," or anomaly detection. TLS impersonation
-  substantially reduces that risk but does not eliminate it. There is no way to refresh without a
-  browser login, so recovery is manual: capture new cookies, restart, `POST /api/session/reset`.
+- **Deployment fights an IP constraint.** LinkedIn checks that session cookie, client
+  fingerprint and IP reputation are mutually consistent. A cookie captured at home and then used
+  from a cloud host is an IP that has never logged into that account, which burns sessions
+  quickly. A deployed instance realistically needs `LINKEDIN_PROXY` pointed at a **sticky**
+  residential proxy in the login's region — a rotating pool is *worse* than none, since changing
+  IP mid-session invalidates it outright. Without one, expect the live path to degrade to auth
+  failures while cached results keep serving. Running locally, from the machine the cookie was
+  created on, avoids this entirely.
+- **Sessions die unpredictably.** Roughly 1–2 requests/minute and ~80–100/day per account is the
+  safe envelope; the pacing defaults target the low end. TLS impersonation substantially reduces
+  invalidation risk but does not eliminate it. Recovery is manual: capture new cookies, restart,
+  `POST /api/session/reset`.
+- **HTML parsing is inherently more fragile than a JSON contract.** This is a deliberate
+  trade-off, not a preference — LinkedIn retired every JSON profile surface reachable from
+  outside (Finding 1). Anchoring on semantic component classes and heading text mitigates it, and
+  the raw-page store plus `/reparse` limits the blast radius, but a markup change will break
+  fields and the recovery is a parser fix.
+- **Certification issuer is unavailable.** mwlite renders the issuer inline with the
+  certification name rather than as a separate element, so `authority` is always `null`. This is
+  a property of the surface, confirmed across all test profiles.
+- **Skill endorsement counts are unavailable** on mwlite, so `endorsementCount` is always `null`.
+- **Partial data by design.** Fields a profile restricts to connections-only return `null`/`[]`.
 - **Single session, no pool.** Once the circuit breaker opens the service is down until someone
-  refreshes the cookie. `session-health` is keyed for a future pool, but only one is wired today.
-- **Deployment fights the IP constraint.** Running on a cloud host means a datacenter IP that has
-  never logged into the account, which burns sessions quickly (Finding 3). A deployed instance
-  realistically needs `LINKEDIN_PROXY` pointed at a sticky residential proxy in the login's
-  region; without one, expect the live path to degrade to auth failures while cached results keep
-  serving. Running locally from the machine the cookie was created on avoids this entirely.
-- **Undocumented, unstable upstream schema.** Field names and `$type` values have changed between
-  LinkedIn releases and will again. The raw-payload store plus `/reparse` limits the blast radius;
-  it doesn't prevent the breakage.
-- **Partial data by design.** Fields the target profile restricts (e.g. connections-only) return
-  `null`/empty rather than erroring. `profileView` is a single call — contact info and some
-  paginated sections live behind separate endpoints that aren't fetched.
+  refreshes the cookie. `session-health` is keyed for a future pool; only one is wired today.
 - **JSON-file store, not a database.** Fine for one process at moderate volume; unsafe for
-  concurrent writers, and no querying beyond key lookup. Store modules sit behind narrow
-  interfaces so swapping in SQLite/Postgres/Redis wouldn't touch pipeline logic.
-- **No auth on this API.** Anyone who can reach the deployed URL can spend your LinkedIn session's
-  rate budget. An API key and per-caller rate limit would be the first thing to add before
-  exposing this anywhere real.
-- **Long-poll, not push.** Callers past the long-poll window must poll `/api/jobs/{id}`; there's
-  no webhook or SSE completion notification.
+  concurrent writers and no querying beyond key lookup. Store modules sit behind narrow
+  interfaces so SQLite/Postgres/Redis could be swapped in without touching pipeline logic. Note
+  that hosts with ephemeral filesystems wipe `DATA_DIR` on redeploy, which costs the raw-page
+  history that makes `/reparse` useful.
+- **No auth on this API.** Anyone who can reach the deployed URL can spend the LinkedIn
+  session's rate budget. An API key and per-caller rate limit is the first thing to add before
+  exposing it anywhere real.
+- **Long-poll, not push.** Callers past the long-poll window must poll `/api/jobs/{id}`.
+- **Profiles only.** The brief asks for profile-page data; company/organization pages are a
+  different URL type and surface, and are not handled.
 
 ## Considered and rejected
 
-- **RSC / flight-protocol reverse engineering** — what the browser actually uses today, but
-  requires tracking build-hash action IDs that rotate every deploy and parsing React's internal
-  stream format. Voyager works and is far more stable. (Finding 1.)
-- **Residential/mobile proxy rotation** — standard for anonymous scraping, counterproductive here:
-  bouncing *one authenticated session* across rotating IPs and geographies is itself a strong
+- **RSC / flight-protocol reverse engineering** — what the desktop site actually uses, but it
+  requires tracking build-hash action IDs that rotate on every deploy and parsing React's
+  internal stream format. mwlite returns the same data to one plain request.
+- **Residential proxy rotation** — standard for anonymous scraping, counterproductive here:
+  bouncing *one authenticated session* across rotating IPs is itself a strong
   account-compromise signal. A single stable egress IP is safer for session-based access.
 - **Username/password login flow** — performing the login handshake server-side trips security
-  challenges (CAPTCHA/2FA) far more readily than reusing an existing session, and would mean
-  storing full credentials rather than a revocable token.
-- **Public-page JSON-LD only** — no session and no account risk, but returns a thin subset
-  (roughly name/headline/partial experience), missing the skills, certifications, languages, and
-  full about text this API is required to return. Viable as a future degraded fallback when the
-  circuit breaker is open; not viable as the primary path.
+  challenges far more readily than reusing an existing session, and would mean storing full
+  credentials rather than a revocable token.
+- **Public-page JSON-LD** — no session and no account risk, but unauthenticated profile requests
+  are answered with a `999` authwall, and the data would be a thin subset in any case.
