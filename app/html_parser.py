@@ -125,6 +125,23 @@ _TOPCARD_NOISE = re.compile(
 )
 
 
+# The collapse/expand affordances render inside the text block, so they arrive appended to the
+# content rather than as separate lines: "...ready solutions. …See more See less" or "...etc. …more".
+# Anchored to a trailing ellipsis or the literal "see" so a description genuinely ending in the
+# word "more" is left alone.
+_TRAILING_UI_NOISE = re.compile(
+    r"(?:\s*(?:…\s*(?:see\s+)?more|see\s+more|see\s+less|…))+\s*$", re.I
+)
+
+
+def _strip_ui_noise(text: str | None) -> str | None:
+    cleaned = _clean(text)
+    if not cleaned:
+        return None
+    cleaned = _TRAILING_UI_NOISE.sub("", cleaned).strip()
+    return cleaned or None
+
+
 def _is_locationish(text: str) -> bool:
     """Location lines are short and comma-delimited ("Bengaluru, Karnataka, India"), which
     distinguishes them from descriptions and from company names."""
@@ -182,6 +199,90 @@ def _parse_entity(lockup: Tag) -> dict[str, Any]:
         "isCurrent": is_current,
         "extras": extras,
     }
+
+
+def _parse_experience_lockup(lockup: Tag) -> list[dict[str, Any]]:
+    """Expand one Experience lockup into an entry per role.
+
+    LinkedIn groups positions by employer: the lockup's `list-item-heading` is the *company*,
+    and each role held there is a `body-small-bold` span followed by its own dates and location.
+    Reading the heading as the job title (the obvious guess) inverts title and company on every
+    entry, and collapsing the lockup to a single entry silently drops every role after the first
+    for anyone promoted within a company.
+    """
+    for hidden in lockup.select(".sr-only, .visually-hidden"):
+        hidden.decompose()
+
+    heading = lockup.select_one(".list-item-heading")
+    company = _clean(heading.get_text(" ", strip=True)) if heading else None
+
+    # Walk the leaves in order, starting a new role at each bold role span.
+    roles: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    for node in lockup.find_all(["span", "div", "p"]):
+        if node.find(["span", "div", "p"]):
+            continue
+        text = _clean(node.get_text(" ", strip=True))
+        if not text or _UI_NOISE.match(text):
+            continue
+
+        parent_classes = set(node.parent.get("class") or [])
+        if "list-item-heading" in parent_classes:
+            continue  # the company heading itself
+
+        if "body-small-bold" in parent_classes:
+            if current:
+                roles.append(current)
+            current = {"title": text, "lines": [], "location": None}
+            continue
+
+        if current is None:
+            continue
+
+        if "text-color-text-low-emphasis" in parent_classes and _is_locationish(text):
+            current["location"] = current["location"] or text
+        else:
+            current["lines"].append(text)
+
+    if current:
+        roles.append(current)
+
+    # Ungrouped lockup (no bold role spans): the heading is the title after all.
+    if not roles:
+        entity = _parse_entity(lockup)
+        return [
+            {
+                "title": entity["title"],
+                "companyName": entity["subtitle"],
+                "location": entity["location"],
+                "description": entity["description"],
+                "startDate": entity["startDate"],
+                "endDate": entity["endDate"],
+                "isCurrent": entity["isCurrent"],
+            }
+        ]
+
+    summary = lockup.select_one(".truncated-summary, .whitespace-pre-line")
+    description = _strip_ui_noise(summary.get_text(" ", strip=True)) if summary else None
+
+    entries = []
+    for role in roles:
+        start, end, is_current = _extract_dates(" ".join(role["lines"]))
+        entries.append(
+            {
+                "title": role["title"],
+                "companyName": company,
+                "location": role["location"],
+                # A grouped lockup carries at most one description block; attach it to the
+                # current role rather than duplicating it across every position.
+                "description": description if is_current else None,
+                "startDate": start,
+                "endDate": end,
+                "isCurrent": is_current,
+            }
+        )
+    return entries
 
 
 def _section_buckets(soup: BeautifulSoup) -> dict[str, list[Tag]]:
@@ -291,6 +392,18 @@ def parse_profile_html(html: str, public_identifier: str, profile_url: str) -> d
     # NB: #about-profile is a hidden "About this profile" bottom-sheet modal, not the summary.
     # The real About text is a truncated-summary that sits outside any entity lockup.
     about = None
+    # When a profile publishes no location, LinkedIn fills that top-card slot with the member's
+    # school instead. The slot is the same either way, so the only reliable signal is that the
+    # text also appears as an education entry — in which case it is not a location.
+    if location:
+        school_names = {
+            _clean(l.select_one(".list-item-heading").get_text(" ", strip=True))
+            for l in soup.select(".profile-entity-lockup")
+            if l.select_one(".list-item-heading")
+        }
+        if location in school_names:
+            location = None
+
     about_heading = next(
         (
             h
@@ -307,13 +420,13 @@ def parse_profile_html(html: str, public_identifier: str, profile_url: str) -> d
                 or "whitespace-pre-line" in (t.get("class") or [])
             )
         )
-        about = _clean(node.get_text(" ", strip=True)) if node else None
+        about = _strip_ui_noise(node.get_text(" ", strip=True)) if node else None
 
     if not about:
         for candidate in soup.select(".truncated-summary, .whitespace-pre-line"):
             if candidate.find_parent(class_="profile-entity-lockup"):
                 continue
-            text = _clean(candidate.get_text(" ", strip=True))
+            text = _strip_ui_noise(candidate.get_text(" ", strip=True))
             if text and len(text) > 40:
                 about = text
                 break
@@ -322,18 +435,7 @@ def parse_profile_html(html: str, public_identifier: str, profile_url: str) -> d
 
     experience = []
     for lockup in buckets.get("experience", []):
-        e = _parse_entity(lockup)
-        experience.append(
-            {
-                "title": e["title"],
-                "companyName": e["subtitle"],
-                "location": e["location"],
-                "description": e["description"],
-                "startDate": e["startDate"],
-                "endDate": e["endDate"],
-                "isCurrent": e["isCurrent"],
-            }
-        )
+        experience.extend(_parse_experience_lockup(lockup))
 
     education = []
     for lockup in buckets.get("education", []):

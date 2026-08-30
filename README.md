@@ -307,24 +307,32 @@ Languages section is normal, and the API reports that honestly rather than guess
 
 ## Validation
 
-Verified end to end against three live profiles of deliberately different shape:
+Verified end to end against five live profiles of deliberately different shape and size:
 
-| | Profile A | Profile B | Profile C |
-| --- | --- | --- | --- |
-| headline / location | 55 / — | 72 / 38 | 132 / 9 |
-| about | 668 chars | 47 chars | absent |
-| experience | 14 | 5 | 4 |
-| education | 3 | 3 | 1 |
-| skills | 37 | 9 | 31 |
-| certifications | 6 | 8 | 0 |
-| languages | 3 | 0 | 0 |
+| | A | B | C | D | E |
+| --- | --- | --- | --- | --- | --- |
+| experience | 14 | 7 | 4 | 2 | 11 |
+| education | 3 | 3 | 1 | 1 | 2 |
+| skills | 37 | 9 | 31 | 9 | 30 |
+| certifications | 6 | 8 | 0 | 1 | 6 |
+| languages | 3 | 0 | 0 | 0 | 2 |
+| about | yes | — | — | yes | yes |
 
-Every empty value was confirmed against the markup rather than assumed: profile A has no
-location element, B and C have no Languages section, C has no About or Certifications. Element
-counts reconcile exactly (e.g. C: 5 lockups = 4 experience + 1 education, 31 `skill-item` = 31
-skills, 0 `sub-list-item` = 0 certifications).
+Every empty value was confirmed against the markup rather than assumed — a section absent from
+the page is reported as `[]`/`null` rather than guessed at. Element counts reconcile exactly
+(e.g. profile C: 5 lockups = 4 experience + 1 education, 31 `skill-item` = 31 skills, 0
+`sub-list-item` = 0 certifications).
 
----
+Three bugs were found only by printing a real profile's *contents* rather than field counts,
+which is worth recording because counts look identical whether or not values are correct:
+
+- **Title and company were inverted on every experience entry.** LinkedIn groups positions by
+  employer, so a lockup's `list-item-heading` is the *company* and each role is a nested
+  `body-small-bold` span. Reading the heading as the job title inverts both fields.
+- **Roles after the first were silently dropped.** The same grouping means anyone promoted
+  within a company had their earlier positions discarded; one test profile returned 1 entry
+  where the profile listed 5.
+- **Member location was never real.** See Known Limitations.
 
 ## Known limitations
 
@@ -348,6 +356,17 @@ skills, 0 `sub-list-item` = 0 certifications).
   outside (Finding 1). Anchoring on semantic component classes and heading text mitigates it, and
   the raw-page store plus `/reparse` limits the blast radius, but a markup change will break
   fields and the recovery is a parser fix.
+- **Member location is not available.** The mwlite top card has a slot where a location would
+  sit, but across every profile tested it contains the member's *school* rather than a location,
+  and no location string appears anywhere else in the page — not in the markup, not in meta tags,
+  not in the title. `location` is therefore `null`. An earlier version returned that slot's
+  contents and so reported school and company names as locations: plausible-looking values that
+  were simply wrong, which is worse than reporting nothing. Per-role locations *are* available
+  and are returned on `experience[].location`.
+- **Long descriptions are truncated by the source.** mwlite server-renders only the collapsed
+  portion of a long text block, with the remainder behind a client-side expand this service does
+  not perform. The trailing `…more` affordance is stripped, but the text it hides is not
+  recoverable from a single request.
 - **Certification issuer is unavailable.** mwlite renders the issuer inline with the
   certification name rather than as a separate element, so `authority` is always `null`. This is
   a property of the surface, confirmed across all test profiles.
