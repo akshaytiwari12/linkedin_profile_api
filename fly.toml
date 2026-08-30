@@ -1,0 +1,49 @@
+# Fly.io deployment.
+#
+# Region is Mumbai deliberately: LinkedIn checks that the session cookie, the client
+# fingerprint and the IP's geography are mutually consistent, so hosting far from where the
+# account normally signs in adds an "impossible travel" signal on top of the datacenter-IP one.
+# See README "Known limitations".
+
+app = "linkedin-profile-api"
+primary_region = "bom"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8000"
+  DATA_DIR = "/data"
+  IMPERSONATE = "chrome"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  # The in-process worker paces requests against a single LinkedIn session; a second machine
+  # would pace independently against the same session and get it flagged.
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 40
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# Optional: keeps the raw-page history (and therefore /reparse) across deploys.
+# Create it once with:  fly volumes create data --region bom --size 1
+# then uncomment:
+# [[mounts]]
+#   source = "data"
+#   destination = "/data"

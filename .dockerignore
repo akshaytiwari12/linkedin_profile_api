@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+!.env.example
+data/
+fixtures/
+scripts/
+tests/
+__pycache__/
+*.pyc
+.venv/
+render.yaml
+Procfile
