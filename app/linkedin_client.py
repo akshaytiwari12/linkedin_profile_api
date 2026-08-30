@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any
 
@@ -5,6 +6,7 @@ from curl_cffi.requests import AsyncSession
 
 from .config import config
 from .errors import LinkedInAuthError, LinkedInBlockedError, ProfileNotFoundError
+from .session_jar import new_session
 
 BASE_URL = "https://www.linkedin.com/voyager/api"
 
@@ -122,28 +124,68 @@ def build_page_headers() -> dict[str, str]:
     }
 
 
+# One long-lived session for the process, seeded with durable cookies only.
+#
+# The volatile cookies (__cf_bm, lidc) must not come from configuration: __cf_bm expires after
+# 30 minutes of inactivity, so a service replaying the value captured at setup would serve for
+# half an hour and then redirect-loop forever. Holding the session lets LinkedIn and Cloudflare
+# issue those cookies and refresh them via Set-Cookie, which is what makes unattended operation
+# possible at all (verified by scripts/check_deploy_viability.py).
+_session: AsyncSession | None = None
+_session_lock = asyncio.Lock()
+
+
+async def _get_session() -> AsyncSession:
+    global _session
+    async with _session_lock:
+        if _session is None:
+            session = new_session()
+            headers = {k: v for k, v in build_page_headers().items() if k != "cookie"}
+            try:
+                # One warm-up so the volatile cookies exist before the first profile request.
+                await session.get(
+                    "https://www.linkedin.com/",
+                    headers=headers,
+                    impersonate=MOBILE_IMPERSONATE,
+                    timeout=45,
+                )
+            except Exception:  # noqa: BLE001 - a failed warm-up is not fatal; the fetch will report
+                pass
+            _session = session
+        return _session
+
+
+async def reset_session() -> None:
+    """Drop the cached session so the next request re-warms with fresh cookies from config."""
+    global _session
+    async with _session_lock:
+        _session = None
+
+
 async def fetch_profile_html(public_identifier: str) -> str:
     """Fetch a profile page as HTML. Returns the raw markup for the parser."""
     kwargs: dict[str, Any] = {}
     if config.proxy:
         kwargs["proxies"] = {"http": config.proxy, "https": config.proxy}
 
-    async with AsyncSession() as session:
-        try:
-            response = await session.get(
-                f"https://www.linkedin.com/in/{public_identifier}/",
-                headers=build_page_headers(),
-                impersonate=MOBILE_IMPERSONATE,
-                allow_redirects=True,
-                timeout=45,
-                **kwargs,
-            )
-        except Exception as err:  # noqa: BLE001
-            # A dead session bounces between the profile page and the login wall until the
-            # redirect limit trips, so an exhausted redirect chain means auth, not a network fault.
-            if "redirect" in str(err).lower():
-                raise LinkedInAuthError() from err
-            raise
+    session = await _get_session()
+    headers = {k: v for k, v in build_page_headers().items() if k != "cookie"}
+
+    try:
+        response = await session.get(
+            f"https://www.linkedin.com/in/{public_identifier}/",
+            headers=headers,
+            impersonate=MOBILE_IMPERSONATE,
+            allow_redirects=True,
+            timeout=45,
+            **kwargs,
+        )
+    except Exception as err:  # noqa: BLE001
+        # A dead session bounces between the profile page and the login wall until the
+        # redirect limit trips, so an exhausted redirect chain means auth, not a network fault.
+        if "redirect" in str(err).lower():
+            raise LinkedInAuthError() from err
+        raise
 
     if response.status_code in (401, 403):
         raise LinkedInAuthError()

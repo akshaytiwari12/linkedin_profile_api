@@ -8,6 +8,7 @@ from . import stores, worker
 from .config import config
 from .errors import InvalidProfileUrlError
 from .html_parser import PARSER_VERSION, parse_profile_html
+from .linkedin_client import reset_session
 from .profile_url import extract_public_identifier
 
 
@@ -132,5 +133,8 @@ async def session_health():
 
 @app.post("/api/session/reset")
 async def session_reset():
+    """Clear the circuit breaker and drop the cached HTTP session, so the next request re-warms
+    with whatever cookies are currently configured."""
     stores.reset_session_health()
+    await reset_session()
     return {"status": "reset"}
