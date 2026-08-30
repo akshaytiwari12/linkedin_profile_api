@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 from curl_cffi.requests import AsyncSession
@@ -27,6 +28,23 @@ def build_headers() -> dict[str, str]:
         "accept": "application/vnd.linkedin.normalized+json+2.1",
         "x-restli-protocol-version": "2.0.0",
         "x-li-lang": "en_US",
+        # voyager identifies its own web client with this; requests without it look like they
+        # came from something that isn't the LinkedIn SPA. Observed verbatim in browser traffic.
+        "x-li-track": json.dumps(
+            {
+                "clientVersion": "1.13.46267",
+                "mpVersion": "1.13.46267",
+                "osName": "web",
+                "timezoneOffset": 5.5,
+                "timezone": "Asia/Calcutta",
+                "deviceFormFactor": "DESKTOP",
+                "mpName": "voyager-web",
+                "displayDensity": 2,
+                "displayWidth": 2560,
+                "displayHeight": 1440,
+            },
+            separators=(",", ":"),
+        ),
         "referer": "https://www.linkedin.com/",
     }
 
@@ -69,7 +87,75 @@ async def voyager_get(path: str) -> Any:
 
 
 async def fetch_profile_view(public_identifier: str) -> Any:
+    """Legacy voyager JSON fetch. Retained for reference — LinkedIn now answers this endpoint
+    with 410 Gone. fetch_profile_html is the live path."""
     try:
         return await voyager_get(f"/identity/profiles/{public_identifier}/profileView")
     except ProfileNotFoundError:
         raise ProfileNotFoundError(public_identifier) from None
+
+
+# LinkedIn serves the lightweight mobile-web ("mwlite") profile to mobile clients, and unlike
+# the desktop app it server-renders the whole profile into the HTML rather than fetching it
+# client-side. That makes it the only surface that still returns profile data to a single
+# no-browser request.
+MOBILE_UA = (
+    "Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+)
+MOBILE_IMPERSONATE = "chrome131_android"
+
+
+def build_page_headers() -> dict[str, str]:
+    return {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
+        "cookie": config.cookie_jar
+        or f'li_at={config.li_at}; JSESSIONID="{config.jsessionid}"',
+        "user-agent": MOBILE_UA,
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"Android"',
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "upgrade-insecure-requests": "1",
+    }
+
+
+async def fetch_profile_html(public_identifier: str) -> str:
+    """Fetch a profile page as HTML. Returns the raw markup for the parser."""
+    kwargs: dict[str, Any] = {}
+    if config.proxy:
+        kwargs["proxies"] = {"http": config.proxy, "https": config.proxy}
+
+    async with AsyncSession() as session:
+        try:
+            response = await session.get(
+                f"https://www.linkedin.com/in/{public_identifier}/",
+                headers=build_page_headers(),
+                impersonate=MOBILE_IMPERSONATE,
+                allow_redirects=True,
+                timeout=45,
+                **kwargs,
+            )
+        except Exception as err:  # noqa: BLE001
+            # A dead session bounces between the profile page and the login wall until the
+            # redirect limit trips, so an exhausted redirect chain means auth, not a network fault.
+            if "redirect" in str(err).lower():
+                raise LinkedInAuthError() from err
+            raise
+
+    if response.status_code in (401, 403):
+        raise LinkedInAuthError()
+    if response.status_code in (429, 999):
+        raise LinkedInBlockedError()
+    if response.status_code == 404:
+        raise ProfileNotFoundError(public_identifier)
+    if response.status_code != 200:
+        raise RuntimeError(f"LinkedIn request failed: {response.status_code}")
+
+    html = response.text
+    if "authwall" in html.lower() or len(html) < 20000:
+        raise LinkedInAuthError("LinkedIn served an auth wall instead of the profile.")
+
+    return html

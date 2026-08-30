@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from . import stores, worker
 from .config import config
 from .errors import InvalidProfileUrlError
-from .profile_parser import PARSER_VERSION, parse_profile_view
+from .html_parser import PARSER_VERSION, parse_profile_html
 from .profile_url import extract_public_identifier
 
 
@@ -120,7 +120,7 @@ async def reparse(public_identifier: str):
         )
 
     profile_url = f"https://www.linkedin.com/in/{public_identifier}/"
-    profile = parse_profile_view(record["raw"], public_identifier, profile_url)
+    profile = parse_profile_html(record["raw"], public_identifier, profile_url)
     stores.set_cached(public_identifier, profile, PARSER_VERSION, record["id"])
     return {**profile, "source": "reparsed"}
 

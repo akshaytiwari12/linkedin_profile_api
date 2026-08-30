@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: linkedin-profile-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      # Set these in the Render dashboard — never commit real values.
+      - key: LI_AT_COOKIE
+        sync: false
+      - key: LI_JSESSIONID
+        sync: false
+      - key: LI_COOKIE_JAR
+        sync: false
+      # A deployed instance runs from a datacenter IP, which LinkedIn treats as
+      # untrusted for a session created elsewhere. Point this at a sticky
+      # residential proxy in the login's region, or expect the live path to
+      # degrade to auth failures while cache keeps serving.
+      - key: LINKEDIN_PROXY
+        sync: false
+      - key: IMPERSONATE
+        value: chrome

@@ -1,7 +1,7 @@
 import asyncio
 
 from . import stores
-from .profile_parser import PARSER_VERSION, parse_profile_view
+from .html_parser import PARSER_VERSION, parse_profile_html
 from .session_manager import fetch_profile_through_session
 
 # One worker draining a queue one job at a time — matching the fact that we are pacing a single
@@ -19,7 +19,7 @@ async def _process(job_id: str) -> None:
     try:
         raw = await fetch_profile_through_session(job["publicIdentifier"])
         raw_record = stores.save_raw_payload(job["publicIdentifier"], raw)
-        profile = parse_profile_view(raw, job["publicIdentifier"], job["profileUrl"])
+        profile = parse_profile_html(raw, job["publicIdentifier"], job["profileUrl"])
         stores.set_cached(job["publicIdentifier"], profile, PARSER_VERSION, raw_record["id"])
         stores.mark_completed(job_id, profile)
     except Exception as err:  # noqa: BLE001 - failure reason is surfaced to the caller as-is

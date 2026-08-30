@@ -7,7 +7,7 @@ from typing import Any
 from . import stores
 from .config import config
 from .errors import LinkedInAuthError, LinkedInBlockedError, SessionFlaggedError
-from .linkedin_client import fetch_profile_view
+from .linkedin_client import fetch_profile_html
 
 # Wraps the raw client with the two protections a naive scraper skips:
 #
@@ -43,7 +43,7 @@ async def fetch_profile_through_session(public_identifier: str) -> Any:
     await _throttle()
 
     try:
-        raw = await fetch_profile_view(public_identifier)
+        raw = await fetch_profile_html(public_identifier)
     except (LinkedInAuthError, LinkedInBlockedError) as err:
         failures = health["consecutiveFailures"] + 1
         flagging = failures >= config.session_failure_threshold
