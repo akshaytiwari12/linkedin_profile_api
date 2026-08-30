@@ -22,6 +22,9 @@ from bs4 import BeautifulSoup, Tag
 
 PARSER_VERSION = 2
 
+# LinkedIn caps headlines at 220 characters; anything longer is a different field.
+MAX_HEADLINE_LEN = 250
+
 MONTHS = {
     m: i
     for i, m in enumerate(
@@ -110,6 +113,16 @@ _DURATION = re.compile(r"^\d+\s*(?:yrs?|mos?|years?|months?)(?:\s+\d+\s*(?:yrs?|
 _UI_NOISE = re.compile(r"^(?:…\s*more|see\s+more|see\s+less|…)$", re.I)
 # A date fragment on its own line, e.g. "Jan 2024 -" or "Present"
 _DATE_FRAGMENT = re.compile(r"^(?:(?:[A-Za-z]{3,9}\s+)?\d{4}\s*[-–—]?|Present)$", re.I)
+
+
+# Top-card chrome that sits between the name, headline and location: connection counts, action
+# buttons, and degree-of-connection badges.
+_TOPCARD_NOISE = re.compile(
+    r"^(?:\d[\d,]*\+?\s*(?:connections?|followers?)"
+    r"|connect|message|follow(?:ing)?|contact(?: info)?|more|save|share"
+    r"|\d+(?:st|nd|rd|th)|[a-z0-9]{1,3})$",
+    re.I,
+)
 
 
 def _is_locationish(text: str) -> bool:
@@ -236,25 +249,44 @@ def parse_profile_html(html: str, public_identifier: str, profile_url: str) -> d
         first_name = parts[0]
         last_name = " ".join(parts[1:]) or None
 
-    # Headline and location are the first two text lines after the name in the top card.
-    headline = location = None
+    # The top card labels its own fields, so read them from the markup rather than guessing
+    # from text length or position — both vary between profiles and mis-assign silently.
+    #
+    #   headline  span whose parent is  body-small text-color-text
+    #   location  span whose parent is  body-small text-color-text-low-emphasis
+    #   company   span carrying         member-current-company
+    #
+    # Not every profile renders a location; when it is absent the field stays null rather than
+    # being back-filled with the company, which is what a positional guess does.
+    headline = location = current_company = None
     if name_el:
-        siblings: list[str] = []
-        for sib in name_el.find_all_next(["h2", "p", "span", "div"], limit=40):
-            if sib.find(["h2", "p", "span", "div"]):
+        for node in name_el.find_all_next(["span", "p", "div"], limit=60):
+            if node.find(["span", "p", "div"]):
                 continue
-            text = _clean(sib.get_text(" ", strip=True))
-            if text and text != full_name and text not in siblings:
-                siblings.append(text)
-            if len(siblings) >= 4:
+
+            own = set(node.get("class") or [])
+            parent = set(node.parent.get("class") or [])
+
+            if "sr-only" in own or "visually-hidden" in own:
+                continue  # accessibility duplicates of visible text
+            if {"truncated-summary", "whitespace-pre-line"} & (own | parent):
+                break  # reached the About block; the top card is finished
+
+            text = _clean(node.get_text(" ", strip=True))
+            if not text or text == full_name:
+                continue
+
+            if "member-current-company" in own:
+                current_company = current_company or text
+            elif "text-color-text-low-emphasis" in parent and "whitespace-nowrap" not in own:
+                if not _TOPCARD_NOISE.match(text):
+                    location = location or text
+            elif "body-small" in parent and "text-color-text" in parent:
+                if not _TOPCARD_NOISE.match(text):
+                    headline = headline or text
+
+            if headline and location and current_company:
                 break
-        if siblings:
-            headline = siblings[0]
-        if len(siblings) > 1:
-            location = next(
-                (s for s in siblings[1:] if not s.lower().startswith(("connect", "message", "follow"))),
-                None,
-            )
 
     # NB: #about-profile is a hidden "About this profile" bottom-sheet modal, not the summary.
     # The real About text is a truncated-summary that sits outside any entity lockup.
@@ -359,6 +391,7 @@ def parse_profile_html(html: str, public_identifier: str, profile_url: str) -> d
         "fullName": full_name,
         "headline": headline,
         "location": location,
+        "currentCompany": current_company,
         "about": about,
         "profileImages": _profile_images(soup),
         "experience": experience,
