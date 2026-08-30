@@ -150,8 +150,8 @@ classes, and sections are located by their heading text rather than by position:
 
 | Field | Anchor |
 | --- | --- |
-| headline | span whose parent is `body-small text-color-text` |
-| location | span whose parent is `body-small text-color-text-low-emphasis` |
+| headline | top-card child `div.body-small.text-color-text` |
+| location | top-card child `div.body-small.…low-emphasis` ending in a connection count |
 | current company | `member-current-company` |
 | experience / education | `profile-entity-lockup`, bucketed by nearest preceding heading |
 | skills | `skill-item` |
@@ -332,7 +332,10 @@ which is worth recording because counts look identical whether or not values are
 - **Roles after the first were silently dropped.** The same grouping means anyone promoted
   within a company had their earlier positions discarded; one test profile returned 1 entry
   where the profile listed 5.
-- **Member location was never real.** See Known Limitations.
+- **Member location was read from the wrong element.** The top card's rows are container divs
+  whose children hold the text, so a leaf-node walk skipped the location row entirely and picked
+  up the school/company row instead. Every profile does publish a location; it sits in the row
+  that ends with the connection count.
 
 ## Known limitations
 
@@ -356,13 +359,6 @@ which is worth recording because counts look identical whether or not values are
   outside (Finding 1). Anchoring on semantic component classes and heading text mitigates it, and
   the raw-page store plus `/reparse` limits the blast radius, but a markup change will break
   fields and the recovery is a parser fix.
-- **Member location is not available.** The mwlite top card has a slot where a location would
-  sit, but across every profile tested it contains the member's *school* rather than a location,
-  and no location string appears anywhere else in the page — not in the markup, not in meta tags,
-  not in the title. `location` is therefore `null`. An earlier version returned that slot's
-  contents and so reported school and company names as locations: plausible-looking values that
-  were simply wrong, which is worse than reporting nothing. Per-role locations *are* available
-  and are returned on `experience[].location`.
 - **Long descriptions are truncated by the source.** mwlite server-renders only the collapsed
   portion of a long text block, with the remainder behind a client-side expand this service does
   not perform. The trailing `…more` affordance is stripped, but the text it hides is not

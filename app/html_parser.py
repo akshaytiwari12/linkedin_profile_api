@@ -125,6 +125,12 @@ _TOPCARD_NOISE = re.compile(
 )
 
 
+# The top card's location row ends with the member's connection/follower count
+# ("Pune Division, Maharashtra, India 500+ connections"); splitting there yields the location and
+# also distinguishes that row from the school/company row above it.
+_CONNECTION_COUNT = re.compile(r"\s*\d[\d,]*\+?\s*(?:connections?|followers?)\s*$", re.I)
+
+
 # The collapse/expand affordances render inside the text block, so they arrive appended to the
 # content rather than as separate lines: "...ready solutions. …See more See less" or "...etc. …more".
 # Anchored to a trailing ellipsis or the literal "see" so a description genuinely ending in the
@@ -350,60 +356,43 @@ def parse_profile_html(html: str, public_identifier: str, profile_url: str) -> d
         first_name = parts[0]
         last_name = " ".join(parts[1:]) or None
 
-    # The top card labels its own fields, so read them from the markup rather than guessing
-    # from text length or position — both vary between profiles and mis-assign silently.
+    # The top card is a container whose direct children are the fields, in a consistent order:
     #
-    #   headline  span whose parent is  body-small text-color-text
-    #   location  span whose parent is  body-small text-color-text-low-emphasis
-    #   company   span carrying         member-current-company
+    #   div.flex.items-center                    the name
+    #   div.body-small.text-color-text           the headline
+    #   div.body-small.…low-emphasis             school or current company
+    #   div.body-small.…low-emphasis             location, with the connection count appended
     #
-    # Not every profile renders a location; when it is absent the field stays null rather than
-    # being back-filled with the company, which is what a positional guess does.
+    # Read the containers rather than their leaf nodes: the location div wraps child elements, so
+    # a leaf-only walk skips it entirely and the field silently comes back empty. The two
+    # low-emphasis rows are told apart by the trailing "N connections" — that row is the location.
     headline = location = current_company = None
     if name_el:
-        for node in name_el.find_all_next(["span", "p", "div"], limit=60):
-            if node.find(["span", "p", "div"]):
+        card = name_el.parent.parent if name_el.parent else None
+        for child in card.find_all(recursive=False) if card else []:
+            classes = set(child.get("class") or [])
+            if "body-small" not in classes:
                 continue
 
-            own = set(node.get("class") or [])
-            parent = set(node.parent.get("class") or [])
-
-            if "sr-only" in own or "visually-hidden" in own:
-                continue  # accessibility duplicates of visible text
-            if {"truncated-summary", "whitespace-pre-line"} & (own | parent):
-                break  # reached the About block; the top card is finished
-
-            text = _clean(node.get_text(" ", strip=True))
-            if not text or text == full_name:
+            text = _clean(child.get_text(" ", strip=True))
+            if not text:
                 continue
 
-            if "member-current-company" in own:
-                current_company = current_company or text
-            elif "text-color-text-low-emphasis" in parent and "whitespace-nowrap" not in own:
-                if not _TOPCARD_NOISE.match(text):
-                    location = location or text
-            elif "body-small" in parent and "text-color-text" in parent:
-                if not _TOPCARD_NOISE.match(text):
-                    headline = headline or text
+            if "text-color-text-low-emphasis" in classes:
+                match = _CONNECTION_COUNT.search(text)
+                if match:
+                    location = location or (text[: match.start()].strip() or None)
+            elif "text-color-text" in classes:
+                headline = headline or text
 
-            if headline and location and current_company:
-                break
+        company_el = soup.select_one(".member-current-company")
+        current_company = (
+            _clean(company_el.get_text(" ", strip=True)) if company_el else None
+        )
 
     # NB: #about-profile is a hidden "About this profile" bottom-sheet modal, not the summary.
     # The real About text is a truncated-summary that sits outside any entity lockup.
     about = None
-    # When a profile publishes no location, LinkedIn fills that top-card slot with the member's
-    # school instead. The slot is the same either way, so the only reliable signal is that the
-    # text also appears as an education entry — in which case it is not a location.
-    if location:
-        school_names = {
-            _clean(l.select_one(".list-item-heading").get_text(" ", strip=True))
-            for l in soup.select(".profile-entity-lockup")
-            if l.select_one(".list-item-heading")
-        }
-        if location in school_names:
-            location = None
-
     about_heading = next(
         (
             h
