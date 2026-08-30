@@ -172,6 +172,26 @@ observed top-card orderings so that class of bug cannot return.
 
 ---
 
+## Deployment status
+
+Deployed at **https://linkedin-profile-api-tmc0.onrender.com** — `/docs`, `/redoc`, `/health`
+and `/api/session/health` all serve from there.
+
+Live profile fetches from that instance currently fail, and the cause is documented under Known
+Limitations: a request carrying this session from a datacenter IP causes LinkedIn to revoke the
+session outright. Resolving it needs `LINKEDIN_PROXY` set to a sticky residential endpoint in
+the account's region; the code path already exists and needs no change.
+
+**Every result in the Validation table was produced by running locally**, where the request
+originates from the same connection the session was created on. To reproduce:
+
+```bash
+cp .env.example .env          # add LI_AT_COOKIE and LI_JSESSIONID
+pip install -r requirements.txt
+uvicorn app.main:app --port 8000
+curl "http://localhost:8000/api/profile?url=https://www.linkedin.com/in/<profile>"
+```
+
 ## Setup
 
 ### 1. Capture a LinkedIn session
@@ -342,14 +362,21 @@ which is worth recording because counts look identical whether or not values are
 - **This violates LinkedIn's Terms of Service.** Automated access to non-public endpoints is
   against LinkedIn's User Agreement. The backing account risks being challenged, rate-limited or
   restricted. This is a demonstration of technique, not a production-safe integration.
-- **Deployment fights an IP constraint.** LinkedIn checks that session cookie, client
-  fingerprint and IP reputation are mutually consistent. A cookie captured at home and then used
-  from a cloud host is an IP that has never logged into that account, which burns sessions
-  quickly. A deployed instance realistically needs `LINKEDIN_PROXY` pointed at a **sticky**
-  residential proxy in the login's region — a rotating pool is *worse* than none, since changing
-  IP mid-session invalidates it outright. Without one, expect the live path to degrade to auth
-  failures while cached results keep serving. Running locally, from the machine the cookie was
-  created on, avoids this entirely.
+- **A datacenter IP destroys the session on first use — measured, not assumed.** Deployed to
+  Render (Singapore), the service returned an auth error on its very first profile request. The
+  significant part is what happened to the cookie: it had been verified working from a home
+  connection fifteen minutes earlier, and after that single request from the cloud it was dead
+  **everywhere, including locally**. The deployed request did not merely fail to authenticate;
+  it caused LinkedIn to revoke the session globally.
+
+  This matches published guidance that `li_at` cookies "get burned after one session" on
+  datacenter IPs, and it has a practical consequence: retrying without changing anything costs a
+  fresh cookie every attempt. A deployed instance needs `LINKEDIN_PROXY` pointed at a **sticky
+  residential** proxy in the login's region, configured *before* the instance is given a working
+  cookie. A rotating pool is worse than none — changing IP mid-session invalidates it outright.
+
+  Running locally, from the machine the cookie was created on, avoids this entirely, which is
+  why every result in the Validation table above was produced that way.
 - **Sessions die unpredictably.** Roughly 1–2 requests/minute and ~80–100/day per account is the
   safe envelope; the pacing defaults target the low end. TLS impersonation substantially reduces
   invalidation risk but does not eliminate it. Recovery is manual: capture new cookies, restart,
