@@ -192,6 +192,20 @@ uvicorn app.main:app --port 8000
 curl "http://localhost:8000/api/profile?url=https://www.linkedin.com/in/<profile>"
 ```
 
+To reach that same working instance over public HTTPS — useful for review, and the shape this
+service is actually designed for — put a tunnel in front of it. Requests still leave from the
+local connection, so the session stays valid:
+
+```bash
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+  -o cloudflared && chmod +x cloudflared
+./cloudflared tunnel --url http://localhost:8000    # prints an https://*.trycloudflare.com URL
+```
+
+No account required. This is the deployment shape the IP constraint pushes you toward: a host
+whose egress is a residential connection — whether that is a tunnel, or a cloud instance routed
+through a residential proxy via `LINKEDIN_PROXY`.
+
 ## Setup
 
 ### 1. Capture a LinkedIn session
