@@ -405,12 +405,17 @@ async def get_logs(
     tags=["Session"],
     summary="Clear the circuit breaker after refreshing cookies",
     description=(
-        "Call after updating `LI_AT_COOKIE` / `LI_JSESSIONID`. Clears the failure count and drops "
-        "the cached HTTP session so the next request re-warms with the new cookies."
+        "Call after updating `LI_AT_COOKIE` / `LI_JSESSIONID`.\n\n"
+        "Re-reads `.env`, clears the failure count, and drops the cached HTTP session so the next "
+        "request re-warms with the new cookies. **No restart needed** — paste a fresh cookie into "
+        "`.env`, call this, and the service is working again.\n\n"
+        "(On a platform where secrets are set through a dashboard rather than a file, changing "
+        "them restarts the process anyway and this is unnecessary.)"
     ),
     response_model=ResetResponse,
 )
 async def session_reset():
+    config.reload()
     stores.reset_session_health()
     await reset_session()
     return {"status": "reset"}

@@ -20,6 +20,18 @@ def _strip_quotes(value: str) -> str:
 
 
 class Config:
+    def reload(self) -> None:
+        """Re-read .env in place.
+
+        Cookies expire and the fix is to paste a new one, so requiring a process restart to pick
+        it up turns a ten-second recovery into a deployment step — and one that is easy to forget
+        halfway through, leaving a service that looks broken with a perfectly good cookie sitting
+        in its config file. `override=True` matters: python-dotenv will not replace an already-set
+        variable otherwise, which is exactly the case here.
+        """
+        load_dotenv(override=True)
+        self.__init__()
+
     def __init__(self) -> None:
         self.port = int(os.getenv("PORT", "8000"))
 
