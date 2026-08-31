@@ -13,3 +13,5 @@ fixtures/
 .DS_Store
 cloudflared
 SESSION_NOTES.md
+ngrok
+logs/
