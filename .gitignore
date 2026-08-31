@@ -8,6 +8,7 @@ fixtures/
 .env
 .env.*
 !.env.example
+!.env.longrun.example
 *.log
 .DS_Store
 cloudflared
