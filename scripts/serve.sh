@@ -45,7 +45,8 @@ start_api() {
 }
 
 start_tunnel() {
-  "$NGROK_BIN" http "$PORT" --domain="$NGROK_DOMAIN" --log=stdout >>logs/tunnel.log 2>&1 &
+  # --url rather than the deprecated --domain (ngrok 3.39+).
+  "$NGROK_BIN" http "$PORT" --url="https://$NGROK_DOMAIN" --log=stdout >>logs/tunnel.log 2>&1 &
   TUNNEL_PID=$!
   echo "  tunnel   pid $TUNNEL_PID  → https://$NGROK_DOMAIN"
 }

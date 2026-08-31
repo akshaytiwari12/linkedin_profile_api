@@ -8,7 +8,7 @@ from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import request_log, stores, worker
+from . import cookie_persistence, request_log, stores, worker
 from . import status_page as status_page_html
 from .config import config
 from .errors import InvalidProfileUrlError
@@ -416,6 +416,9 @@ async def get_logs(
 )
 async def session_reset():
     config.reload()
+    # Discard any captured rotation: if a fresh cookie has just been pasted, a previously
+    # captured one is stale and would otherwise take precedence over it.
+    cookie_persistence.clear()
     stores.reset_session_health()
     await reset_session()
     return {"status": "reset"}

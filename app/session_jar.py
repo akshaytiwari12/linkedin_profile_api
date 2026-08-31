@@ -20,6 +20,7 @@ ones from Set-Cookie responses.
 
 from curl_cffi.requests import AsyncSession
 
+from . import cookie_persistence
 from .config import config
 
 # Cookies we deliberately never replay from configuration.
@@ -34,11 +35,15 @@ def durable_cookies() -> dict[str, str]:
     Uses LI_COOKIE_JAR when provided (filtered down to the durable set), otherwise falls back to
     the two cookies the voyager API needs.
     """
+    # Prefer a rotation LinkedIn issued over the configured value — it is more recent, and
+    # ignoring it means restarting with a token LinkedIn has already replaced.
+    li_at, jsessionid = cookie_persistence.effective_credentials()
+
     cookies = {
-        "li_at": config.li_at,
+        "li_at": li_at,
         # LinkedIn stores this wrapped in literal double quotes; the cookie keeps them even
         # though the csrf-token header must not have them.
-        "JSESSIONID": f'"{config.jsessionid}"',
+        "JSESSIONID": f'"{jsessionid}"',
     }
 
     if config.cookie_jar:

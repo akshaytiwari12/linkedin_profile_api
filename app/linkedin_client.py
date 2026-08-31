@@ -4,6 +4,7 @@ from typing import Any
 
 from curl_cffi.requests import AsyncSession
 
+from . import cookie_persistence
 from .config import config
 from .errors import LinkedInAuthError, LinkedInBlockedError, ProfileNotFoundError
 from .session_jar import new_session
@@ -211,5 +212,11 @@ async def fetch_profile_html(public_identifier: str) -> str:
     html = response.text
     if "authwall" in html.lower() or len(html) < 20000:
         raise LinkedInAuthError("LinkedIn served an auth wall instead of the profile.")
+
+    # LinkedIn rotates li_at mid-session; keep whatever it just issued so a restart does not
+    # revert to a superseded token.
+    rotated = cookie_persistence.capture(session.cookies.jar)
+    if rotated:
+        print(f"[session] LinkedIn rotated: {sorted(rotated)}", flush=True)
 
     return html
