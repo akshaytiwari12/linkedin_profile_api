@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import request_log, stores, worker
+from . import status_page as status_page_html
 from .config import config
 from .errors import InvalidProfileUrlError
 from .html_parser import PARSER_VERSION, parse_profile_html
@@ -37,6 +38,9 @@ whose handshake looks automated.
     GET /api/profile?url=https://www.linkedin.com/in/some-profile
 
 Use **Try it out** below on `/api/profile` — it is the only endpoint most callers need.
+
+A human-readable service status page, showing session health and recent activity, is at
+[`/status`](/status).
 
 ### How a request is served
 
@@ -151,6 +155,18 @@ async def log_requests(request, call_next):
         status_code=response.status_code,
         headers=dict(response.headers),
         media_type=response.media_type,
+    )
+
+
+@app.get("/status", include_in_schema=False)
+async def status_page() -> HTMLResponse:
+    """Human-readable view of the same data as /api/logs, for opening in a browser."""
+    return HTMLResponse(
+        status_page_html.render(
+            session=stores.get_session_health(),
+            summary=request_log.summary(),
+            requests=request_log.recent(40),
+        )
     )
 
 
