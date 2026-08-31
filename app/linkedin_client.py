@@ -101,9 +101,18 @@ async def fetch_profile_view(public_identifier: str) -> Any:
 # the desktop app it server-renders the whole profile into the HTML rather than fetching it
 # client-side. That makes it the only surface that still returns profile data to a single
 # no-browser request.
+# The user-agent, the client hints and the TLS impersonation target must all describe the same
+# browser. Anti-bot systems cross-check them, and a handshake announcing one Chrome version while
+# the header claims another is a stronger signal than either would be alone. These values are
+# taken verbatim from real browser traffic against LinkedIn.
+_CHROME_MAJOR = "129"
 MOBILE_UA = (
-    "Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+    "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 "
+    f"(KHTML, like Gecko) Chrome/{_CHROME_MAJOR}.0.0.0 Mobile Safari/537.36"
+)
+_SEC_CH_UA = (
+    f'"Google Chrome";v="{_CHROME_MAJOR}", "Not=A?Brand";v="8", '
+    f'"Chromium";v="{_CHROME_MAJOR}"'
 )
 MOBILE_IMPERSONATE = "chrome131_android"
 
@@ -115,8 +124,11 @@ def build_page_headers() -> dict[str, str]:
         "cookie": config.cookie_jar
         or f'li_at={config.li_at}; JSESSIONID="{config.jsessionid}"',
         "user-agent": MOBILE_UA,
+        # Real Chrome always sends these; their absence is as noticeable as a wrong value.
+        "sec-ch-ua": _SEC_CH_UA,
         "sec-ch-ua-mobile": "?1",
         "sec-ch-ua-platform": '"Android"',
+        "sec-ch-prefers-color-scheme": "light",
         "sec-fetch-dest": "document",
         "sec-fetch-mode": "navigate",
         "sec-fetch-site": "none",
