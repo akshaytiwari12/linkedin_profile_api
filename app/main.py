@@ -1,13 +1,14 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path as FilePath
 
 from fastapi import FastAPI, Path, Query
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import stores, worker
+from . import request_log, stores, worker
 from .config import config
 from .errors import InvalidProfileUrlError
 from .html_parser import PARSER_VERSION, parse_profile_html
@@ -101,6 +102,56 @@ app = FastAPI(
 
 _STATIC_DIR = FilePath(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    """Record every API call and its outcome.
+
+    Reads the identifier and source out of the response body for profile calls so the log says
+    *which* profile was requested and whether it came from cache or a live fetch — the two things
+    you actually want to know when someone reports "it didn't work". Documentation and static
+    asset requests are skipped; they are noise.
+    """
+    started = asyncio.get_event_loop().time()
+    response = await call_next(request)
+
+    path = request.url.path
+    if not path.startswith("/api/") and path != "/health":
+        return response
+
+    duration_ms = int((asyncio.get_event_loop().time() - started) * 1000)
+    identifier = source = error = None
+
+    # Buffer the body so it can be inspected and still be sent to the client.
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+
+    if path.startswith("/api/profile"):
+        try:
+            payload = json.loads(body)
+            identifier = payload.get("publicIdentifier")
+            source = payload.get("source")
+            error = payload.get("error")
+        except (ValueError, AttributeError):
+            pass
+
+    request_log.record(
+        path=path,
+        status=response.status_code,
+        duration_ms=duration_ms,
+        identifier=identifier,
+        source=source,
+        error=error,
+    )
+
+    return Response(
+        content=body,
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        media_type=response.media_type,
+    )
 
 
 @app.get("/docs", include_in_schema=False)
@@ -311,6 +362,26 @@ async def reparse(
 )
 async def session_health():
     return stores.get_session_health()
+
+
+@app.get(
+    "/api/logs",
+    tags=["Session"],
+    summary="Recent requests and their outcomes",
+    description=(
+        "What has been called, whether it worked, and why it didn't — without needing shell "
+        "access to the host.\n\n"
+        "Records the profile identifier and the outcome, never the profile data itself. Covers "
+        "the current process only: a restart clears it, and on hosts with an ephemeral "
+        "filesystem so does a redeploy.\n\n"
+        "`outcome` is the field to scan: `ok (live)`, `ok (cache)`, `queued`, "
+        "`linkedin session rejected`, `fetch failed`, `bad request`."
+    ),
+)
+async def get_logs(
+    limit: int = Query(50, ge=1, le=200, description="How many recent entries to return.")
+):
+    return {"summary": request_log.summary(), "requests": request_log.recent(limit)}
 
 
 @app.post(
